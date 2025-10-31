@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1500,10 +1501,19 @@ func (d *Driver) detectIP(c types.ContainerJSON, driverConfig *TaskConfig) (stri
 		return "", false
 	}
 
+	dockerClient, err := d.getDockerClient()
+	if err != nil {
+		return "Failed to create docker client", false
+	}
+
 	ip, ipName := "", ""
 	auto := false
+	transparentNetwork := false
 	for name, net := range c.NetworkSettings.Networks {
 		if net.IPAddress == "" {
+			netInfo, _ := dockerClient.NetworkInspect(d.ctx, net.NetworkID, networkapi.InspectOptions{})
+			transparentNetwork = transparentNetwork || netInfo.Driver == "transparent"
+
 			// Ignore networks without an IP address
 			continue
 		}
@@ -1531,7 +1541,201 @@ func (d *Driver) detectIP(c types.ContainerJSON, driverConfig *TaskConfig) (stri
 			"container_network", ipName)
 	}
 
+	// Windows specific
+	if transparentNetwork && ip == "" {
+		// Get container ip
+		de := containerapi.ExecOptions{}
+		de.AttachStdout = true
+		de.Cmd = []string{"cmd", "/C", fmt.Sprintf("ping -4 %s -n 1", c.Config.Hostname)}
+
+		success := false
+		timesWaited := 0
+		for !success && timesWaited < 30 {
+			timesWaited++
+			time.Sleep(1 * time.Second)
+
+			dExec, execErr := dockerClient.ContainerExecCreate(d.ctx, c.ID, de)
+			if execErr != nil {
+				d.logger.Error("Error: ", "error", execErr)
+				return "", false
+			}
+
+			execId := dExec.ID
+
+			execOpts := containerapi.ExecAttachOptions{}
+
+			resp, startErr := dockerClient.ContainerExecAttach(d.ctx, execId, execOpts)
+			if startErr != nil {
+				d.logger.Warn("failed to retrieve ip address from container with ping", "container_id", c.ID)
+				return "", false
+			}
+
+			sb := new(strings.Builder)
+			// var s string
+			// var err error
+			// for ; err == nil; {
+			// 	s, err = resp.Reader.ReadString('\n')
+
+			// 	sb.WriteString(s)
+			// }
+
+			for {
+				line, err := resp.Reader.ReadString('\n')
+				if len(line) == 0 && err != nil {
+					if err == io.EOF {
+						break
+					}
+					d.logger.Error("Failed to read output from command", "error", err)
+					return "", false
+				}
+
+				sb.WriteString(line)
+			}
+
+			out := sb.String()
+			
+			resp.CloseWrite()
+			resp.Close()
+
+			d.logger.Info("Output from ping", "stdout", out)
+
+			//r, regErr := regexp.Compile(`(IP Address: *)(\d*\.\d*\.\d*\.\d*)`)
+			r, regErr := regexp.Compile(`(Reply from )(\d*\.\d*\.\d*\.\d*)`)
+			if regErr != nil {
+				d.logger.Error("RegExp error", "error", regErr)
+				return "", false
+			} else {
+				ipSlice := r.FindStringSubmatch(out)
+				if len(ipSlice) > 1 {
+					ip = ipSlice[2]
+					auto = true
+					success = true
+				}
+			}
+		}
+
+		// End get container ip
+
+		// Get admin username
+
+		adminCommand := "net user"
+		d.logger.Info(adminCommand)
+
+		de = containerapi.ExecOptions{}
+		de.AttachStdout = true
+		de.Cmd = []string{"cmd", "/C", adminCommand}
+
+		adminExec, adminExecErr := dockerClient.ContainerExecCreate(d.ctx, c.ID, de)
+		if adminExecErr != nil {
+			d.logger.Error("Error: ", "error", adminExecErr)
+			return "", false
+		}
+
+		adminExecId := adminExec.ID
+
+		adminExecOpts := containerapi.ExecStartOptions{}
+
+		resp, startErr := dockerClient.ContainerExecAttach(d.ctx, adminExecId, adminExecOpts)
+
+		if startErr != nil {
+			d.logger.Warn("failed to append hosts file", "container_id", c.ID)
+			return "", false
+		}
+
+		sb := new(strings.Builder)
+
+		for {
+			line, err := resp.Reader.ReadString('\n')
+			if len(line) == 0 && err != nil {
+				if err == io.EOF {
+					break
+				}
+				d.logger.Error("Failed to read output from command", "error", err)
+				return "", false
+			}
+
+			sb.WriteString(line)
+		}
+
+		adminOut := sb.String()
+		
+		resp.Close()
+
+		userName := "Administrator"
+
+		if strings.Contains(adminOut, "ProAdmin") {
+			userName = "ProAdmin"
+		}
+
+		// End get admin username
+
+		// Add host ip to container hosts file
+		echoCommand := fmt.Sprintf("echo %v host.docker.internal >> %%WINDIR%%\\System32\\Drivers\\Etc\\Hosts", GetOutboundIP().To4())
+		d.logger.Info(echoCommand)
+
+		de = containerapi.ExecOptions{}
+		de.AttachStdout = true
+		de.Cmd = []string{"cmd", "/C", echoCommand}
+		de.User = userName
+
+		dExec, execErr := dockerClient.ContainerExecCreate(d.ctx, c.ID, de)
+		if execErr != nil {
+			d.logger.Error("Error: ", "error", execErr)
+			return "", false
+		}
+
+		execId := dExec.ID
+
+		execOpts := containerapi.ExecStartOptions{}
+
+		resp, startErr = dockerClient.ContainerExecAttach(d.ctx, execId, execOpts)
+
+		if startErr != nil {
+			d.logger.Warn("failed to append hosts file", "container_id", c.ID)
+			return "", false
+		}
+
+		sb = new(strings.Builder)
+
+		for {
+			line, err := resp.Reader.ReadString('\n')
+			if len(line) == 0 && err != nil {
+				if err == io.EOF {
+					break
+				}
+				d.logger.Error("Failed to read output from command", "error", err)
+				return "", false
+			}
+
+			sb.WriteString(line)
+		}
+
+		out := sb.String()
+
+		resp.Close()
+
+		d.logger.Info("Output from echo", "stdout", out)
+
+		// End add host ip to container hosts file
+	}
+
+	d.logger.Info("IP", "ip", ip, "auto", auto)
+
+	// End windows specific
+
 	return ip, auto
+}
+
+func GetOutboundIP() net.IP {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		fmt.Println(err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+
+	return localAddr.IP
 }
 
 // containerByName finds a running container by name, and returns an error
